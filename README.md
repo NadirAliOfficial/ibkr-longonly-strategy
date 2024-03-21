@@ -15,4 +15,4 @@ python strategy.py --symbols AAPL --years 10 --exit-mode DAILY_EMA30 --sl-pct 0.
 ````
 
 Configure IBKR host/port/client ID and stop-loss % inside `.env`.
-<!-- updated: 2023-11-23-r01 -->
+<!-- updated: 2024-03-21-r01 -->
