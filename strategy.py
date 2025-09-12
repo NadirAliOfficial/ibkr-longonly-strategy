@@ -1,12 +1,11 @@
-
-
 import argparse
 import csv
 import math
 import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
-
+from datetime import datetime
+import re
 import numpy as np
 import pandas as pd
 import pytz
@@ -47,7 +46,7 @@ def safe_hist(
     ib: IB,
     contract: Stock,
     *,
-    endDateTime: str,
+    endDateTime,  # str or None
     durationStr: str,
     barSizeSetting: str,
     whatToShow: str = "TRADES",
@@ -65,8 +64,9 @@ def safe_hist(
     for attempt in range(max_retries):
         try:
             if verbose:
+                end_str = ("NOW" if (endDateTime in ("", None)) else str(endDateTime))
                 print(f"[IBKR] hist req attempt {attempt+1}/{max_retries} | "
-                      f"{barSizeSetting} {durationStr} {whatToShow} RTH={useRTH} end='{endDateTime or 'NOW'}'")
+                      f"{barSizeSetting} {durationStr} {whatToShow} RTH={useRTH} end='{end_str}'")
             bars = ib.reqHistoricalData(
                 contract,
                 endDateTime=endDateTime,
@@ -179,6 +179,7 @@ def fetch_5m_bars_chunked(
 ) -> pd.DataFrame:
     """
     Fetch ~`years` of 5m RTH bars in chunks to avoid timeouts/pacing.
+    Uses timezone-explicit endDateTime to avoid IB 2174 warnings.
     """
     all_rows: List[pd.DataFrame] = []
     end = ""  # now
@@ -215,9 +216,10 @@ def fetch_5m_bars_chunked(
         df_chunk = df_chunk[["open", "high", "low", "close", "volume"]].copy()
         all_rows.append(df_chunk)
 
-        # Step back to oldest bar - 1 minute for next request
+        # Step back to oldest bar for next request; use explicit UTC tz string to avoid 2174
         oldest = df_chunk.index.min()
-        end = oldest.tz_convert("UTC").strftime("%Y%m%d %H:%M:%S")
+        oldest_utc = oldest.tz_convert("UTC")
+        end = oldest_utc.strftime("%Y%m%d-%H:%M:%S UTC")
 
         span_days = (df_chunk.index.max() - df_chunk.index.min()).days
         got_days += max(span_days, 1)
@@ -334,7 +336,8 @@ def run_backtest_for_symbol(
     what: str,
     chunk_days: int,
     max_retries: int,
-    verbose: bool
+    verbose: bool,
+    cmf_threshold: float = 0.0
 ) -> Tuple[List[Trade], pd.DataFrame]:
     """
     Long-only backtest for one symbol. Returns (trades, equity_curve_df).
@@ -406,7 +409,7 @@ def run_backtest_for_symbol(
 
         # Entry setup on current 4h block
         setup_ok = False
-        cmf_ok = (not math.isnan(row["cmf20"])) and (row["cmf20"] > 0)
+        cmf_ok = (not math.isnan(row["cmf20"])) and (row["cmf20"] > cmf_threshold)
         if (ema20_val is not None) and cmf_ok:
             setup_ok = (row["close"] > ema20_val)
 
@@ -481,10 +484,32 @@ def run_backtest_for_symbol(
     return trades, equity_df
 
 # ----------------------------
-# Outputs & Stats
+# Outputs, Filenames & Stats
 # ----------------------------
-def save_trades_csv(symbol: str, trades: List[Trade]) -> None:
-    path = f"trades_{symbol}.csv"
+def build_filename(kind: str, symbol: str, args) -> str:
+    # Compact, cross-platform friendly timestamp
+    ts = datetime.now(ET).strftime("%Y%m%d_%H%M")
+
+    # Descriptive parts without illegal characters
+    parts = [
+        f"{kind}_{symbol}",
+        f"years-{args.years}",
+        f"exit-{args.exit_mode}",
+        f"slpct-{args.sl_pct}",
+        f"confirm-{args.confirm_bars}",
+        f"slarm-{args.sl_arm_bars}",
+        f"cooldown-{args.cooldown_bars}",
+        ts,
+    ]
+    name = " ".join(parts)
+
+    # Strip characters that are invalid on Windows & co.
+    safe = re.sub(r'[<>:"/\\|?*\n\r\t]+', "_", name).strip("_ ")
+
+    return f"{safe}.csv"
+
+def save_trades_csv(symbol: str, trades: List[Trade], args) -> None:
+    path = build_filename("trades", symbol, args)
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["symbol", "entry_time", "entry_price", "exit_time", "exit_price", "reason", "bars_held", "return_pct"])
@@ -500,22 +525,39 @@ def save_trades_csv(symbol: str, trades: List[Trade]) -> None:
                         f"{ret_pct:.4f}"])
     print(f"[{symbol}] Saved {path}")
 
-def save_equity_csv(symbol: str, equity_df: pd.DataFrame) -> None:
-    path = f"equity_{symbol}.csv"
+def save_equity_csv(symbol: str, equity_df: pd.DataFrame, args) -> None:
+    path = build_filename("equity", symbol, args)
     equity_df.to_csv(path, float_format="%.6f")
     print(f"[{symbol}] Saved {path}")
 
-def quick_stats(trades: List[Trade]) -> str:
+def quick_stats(trades: List[Trade], equity_df: pd.DataFrame) -> str:
     if not trades:
         return "No trades."
+    # Trade-based stats
     pnl = [(t.exit_price / t.entry_price - 1.0) for t in trades]
     wins = [x for x in pnl if x > 0]
     losses = [x for x in pnl if x <= 0]
     win_rate = (len(wins) / len(pnl)) * 100.0 if pnl else 0.0
     pf = (sum(wins) / abs(sum(losses))) if sum(losses) != 0 else float("inf")
-    return (f"Trades: {len(pnl)} | Win%: {win_rate:.1f} | "
-            f"AvgRet: {np.mean(pnl)*100:.2f}% | PF: {pf:.2f} | "
-            f"Best: {np.max(pnl)*100:.2f}% | Worst: {np.min(pnl)*100:.2f}%")
+    avg_ret_pct = np.mean(pnl) * 100.0 if pnl else 0.0
+    best = np.max(pnl) * 100.0
+    worst = np.min(pnl) * 100.0
+
+    # Equity-based stats (Cum P/L and Max Drawdown)
+    if equity_df is not None and not equity_df.empty and "equity" in equity_df.columns:
+        eq = equity_df["equity"].astype(float)
+        eq0, eqN = float(eq.iloc[0]), float(eq.iloc[-1])
+        cum_pl = eqN - eq0
+        cum_pl_pct = (eqN / eq0 - 1.0) * 100.0
+        run_max = eq.cummax()
+        dd_series = eq / run_max - 1.0
+        max_dd_pct = float(dd_series.min() * 100.0)
+    else:
+        cum_pl, cum_pl_pct, max_dd_pct = 0.0, 0.0, 0.0
+
+    return (f"Trades: {len(pnl)} | Win%: {win_rate:.1f} | AvgRet: {avg_ret_pct:.2f}% | "
+            f"PF: {pf:.2f} | Best: {best:.2f}% | Worst: {worst:.2f}% | "
+            f"Cum P/L: {cum_pl:+.2f} ({cum_pl_pct:+.2f}%) | MaxDD: {max_dd_pct:.2f}%")
 
 # ----------------------------
 # CLI
@@ -534,6 +576,7 @@ def parse_args():
     p.add_argument("--cooldown-bars", type=int, default=1)
     p.add_argument("--chunk-days", type=int, default=90, help="Days per 5m chunk request (smaller = safer)")
     p.add_argument("--what", choices=["TRADES", "MIDPOINT"], default="TRADES", help="Primary whatToShow")
+    p.add_argument("--cmf-threshold", type=float, default=0.0, help="CMF threshold; default 0.0 (was >0)")
     p.add_argument("--max-retries", type=int, default=5)
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
@@ -565,12 +608,13 @@ def main():
             what=args.what,
             chunk_days=args.chunk_days,
             max_retries=args.max_retries,
-            verbose=args.verbose
+            verbose=args.verbose,
+            cmf_threshold=args.cmf_threshold
         )
-        save_trades_csv(sym, trades)
+        save_trades_csv(sym, trades, args)
         if not equity.empty:
-            save_equity_csv(sym, equity)
-        print(f"[{sym}] {quick_stats(trades)}")
+            save_equity_csv(sym, equity, args)
+        print(f"[{sym}] {quick_stats(trades, equity)}")
 
     ib.disconnect()
 
