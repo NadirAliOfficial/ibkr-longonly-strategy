@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import time
 import csv
 import math
 import os
@@ -8,12 +9,12 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional, Tuple, Dict
-
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytz
 from dotenv import load_dotenv
-from ib_insync import IB, Stock, util, BarDataList, MarketOrder, LimitOrder
+from ib_insync import IB, Stock, Crypto, util, BarDataList, MarketOrder, LimitOrder
 
 # ----------------------------
 # Config & CLI
@@ -87,7 +88,7 @@ def safe_hist(
         except Exception as e:
             if verbose:
                 print(f"[IBKR] req exception: {e}")
-        ib.sleep(min(30.0, sleep_base * (2 ** attempt)))
+        time.sleep(min(30.0, sleep_base * (2 ** attempt)))
     return pd.DataFrame()
 
 # ----------------------------
@@ -199,7 +200,8 @@ def fetch_5m_bars_chunked(
         all_rows.append(df_chunk)
 
         oldest = df_chunk.index.min().tz_convert("UTC")
-        end = oldest.strftime("%Y%m%d-%H:%M:%S UTC")
+        end = oldest.strftime("%Y%m%d-%H:%M:%S")   # no UTC suffix
+
 
         span_days = (df_chunk.index.max() - df_chunk.index.min()).days
         got_days += max(span_days, 1)
@@ -410,6 +412,8 @@ def run_backtest_for_symbol(
         trades.append(Trade(symbol, idx_list[entry_idx], entry_px, last_t, last_px, "FORCE_EXIT_EOD", len(four) - entry_idx))
 
     equity_df = pd.DataFrame(equity_points).set_index("time")
+    plot_indicators(four, ema20_daily_full, ema30_daily_full)
+
     return trades, equity_df
 
 # ----------------------------
@@ -442,7 +446,8 @@ async def fetch_daily_bars_async(
         except Exception as e:
             if verbose:
                 print(f"[IBKR-ASYNC] daily exception: {e}")
-        await ib.sleep(min(30.0, 1.5 * (2 ** attempt)))
+        await asyncio.sleep(min(30.0, 1.5 * (2 ** attempt)))
+
 
     if what == "TRADES":
         # fallback to MIDPOINT
@@ -484,7 +489,14 @@ class LiveSymbol:
         self.ib = ib
         self.args = args
         self.symbol = symbol
-        self.contract = Stock(symbol, "SMART", "USD"); self.contract.primaryExchange = "NASDAQ"
+        if symbol.upper() in ("BTCUSD", "ETHUSD"):
+            # Create Crypto contract via PAXOS
+            base = symbol.replace("USD", "")
+            self.contract = Crypto(base, "PAXOS")
+        else:
+            # Default to Stock contract
+            self.contract = Stock(symbol, "SMART", "USD")
+            self.contract.primaryExchange = "NASDAQ"
 
         self.position_open = False
         self.entry_px: Optional[float] = None
@@ -505,7 +517,7 @@ class LiveSymbol:
     async def _resolve_px(self, last5m_close: float) -> float:
         # snapshot mkt data; give it a brief moment to populate
         t = self.ib.reqMktData(self.contract, snapshot=True, regulatorySnapshot=False)
-        await self.ib.sleep(0.25)
+        await asyncio.sleep(0.25)
         px = None
         if t is not None:
             try:
@@ -618,7 +630,7 @@ class LiveSymbol:
             durationStr="2 D",
             barSizeSetting="5 mins",
             whatToShow=self.args.what_5m,
-            useRTH=True,
+            useRTH=False,
             formatDate=1,
             keepUpToDate=True
         )
@@ -639,7 +651,7 @@ class LiveSymbol:
                 await self._recalc_daily_emas()
 
             # Let ib_insync process socket events
-            await self.ib.sleep(1.0)
+            await asyncio.sleep(1.0)
 
             # If the stream grew, process the latest bar
             if len(bars) != last_len:
@@ -652,7 +664,10 @@ class LiveSymbol:
         if df5_new.empty: return
         bar_ts = df5_new.index.max()
         bar_ts_et = bar_ts.tz_convert(ET)
-        if not is_rth_now(bar_ts_et): return
+        if isinstance(self.contract, Stock):
+            if not is_rth_now(bar_ts_et):
+                return
+
 
         t = bar_ts_et.time()
         if self._current_day is None:
@@ -791,6 +806,36 @@ def parse_args():
     p.add_argument("--max-retries", type=int, default=5)
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
+
+#  Plotting 
+def plot_indicators(four: pd.DataFrame, ema20_daily: pd.Series, ema30_daily: pd.Series):
+    """
+    Plot 4h OHLC + CMF(20) + daily EMA20/30 overlays.
+    """
+    # Map daily EMA values to 4h timestamps
+    ema20_mapped = four.index.map(lambda ts: ema_value_before_bar(ema20_daily, ts))
+    ema30_mapped = four.index.map(lambda ts: ema_value_before_bar(ema30_daily, ts))
+
+    fig, (ax_price, ax_cmf) = plt.subplots(2, 1, figsize=(14, 8), sharex=True,
+                                           gridspec_kw={'height_ratios': [3, 1]})
+
+    # --- Price + EMAs ---
+    ax_price.plot(four.index, four["close"], label="Close (4h)", color="black", linewidth=1)
+    ax_price.plot(four.index, ema20_mapped, label="EMA20 (Daily)", color="blue", linewidth=1.2)
+    ax_price.plot(four.index, ema30_mapped, label="EMA30 (Daily)", color="red", linewidth=1.2)
+    ax_price.set_title("4h Close with EMA20/30")
+    ax_price.legend(loc="upper left")
+    ax_price.grid(True, alpha=0.3)
+
+    # --- CMF(20) ---
+    ax_cmf.plot(four.index, four["cmf20"], label="CMF(20)", color="green", linewidth=1)
+    ax_cmf.axhline(0, color="grey", linestyle="--", linewidth=0.8)
+    ax_cmf.set_title("Chaikin Money Flow (CMF 20)")
+    ax_cmf.legend(loc="upper left")
+    ax_cmf.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
 
 # ----------------------------
 # Main
