@@ -807,7 +807,7 @@ def parse_args():
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
 
-#  Plotting 
+#  Plotting
 def plot_indicators(four: pd.DataFrame, ema20_daily: pd.Series, ema30_daily: pd.Series):
     """
     Plot 4h OHLC + CMF(20) + daily EMA20/30 overlays.
